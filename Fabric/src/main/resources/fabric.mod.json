@@ -1,0 +1,23 @@
+{
+  "schemaVersion": 1,
+  "id": "safeslot",
+  "version": "${version}",
+
+  "name": "Safeslot",
+  "description": "Automatically backs up player inventories leave. Allows viewing, restoring, and exporting previous inventory states if needed. Intended for easy server moderation.",
+  "authors": [ "HelluPeptic" ],
+
+  "license": "MIT",
+  "icon": "icon.png",
+
+  "environment": "*",
+  "entrypoints": { "main": [ "com.safeslot.SafeslotMod" ] },
+
+  "depends": {
+    "fabricloader": ">=0.12.5",
+    "fabric": "*",
+    "minecraft": ">=1.20",
+    "java": ">=17",
+    "collective": ">=7.91"
+  }
+}
