@@ -1,0 +1,12 @@
+{
+  "required": true,
+  "minVersion": "0.8",
+  "package": "com.safeslot.mixin",
+  "compatibilityLevel": "JAVA_21",
+  "mixins": [
+    "ServerPlayerEntityAccessor"
+  ],
+  "injectors": {
+    "defaultRequire": 1
+  }
+}

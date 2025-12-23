@@ -30,6 +30,7 @@ import com.mojang.brigadier.arguments.StringArgumentType;
 import com.mojang.brigadier.context.CommandContext;
 
 import com.safeslot.util.NbtCompatHelper;
+import com.safeslot.mixin.ServerPlayerEntityAccessor;
 
 public class InventoryRestoreFeature {
     private static final Map<UUID, List<NbtCompound>> playerBackups = new HashMap<>();
@@ -40,9 +41,9 @@ public class InventoryRestoreFeature {
         CommandRegistrationCallback.EVENT.register((dispatcher, registryAccess, environment) -> {
             dispatcher.register(CommandManager.literal("safeslot")
                 .then(CommandManager.literal("inventoryrestore")
-                    .requires(source -> Permissions.check(source, "safeslot.command.view") || source.hasPermissionLevel(2))
+                    .requires(source -> Permissions.check(source, "safeslot.command.view", 2))
                     .then(CommandManager.literal("view")
-                        .requires(source -> Permissions.check(source, "safeslot.command.view") || source.hasPermissionLevel(2))
+                        .requires(source -> Permissions.check(source, "safeslot.command.view", 2))
                         .then(CommandManager.argument("player", StringArgumentType.word())
                             .executes(InventoryRestoreFeature::viewBackups)
                         )
@@ -51,13 +52,13 @@ public class InventoryRestoreFeature {
                         .executes(InventoryRestoreFeature::viewBackups)
                     )
                     .then(CommandManager.literal("save")
-                        .requires(source -> Permissions.check(source, "safeslot.command.manualbackup") || source.hasPermissionLevel(2))
+                        .requires(source -> Permissions.check(source, "safeslot.command.manualbackup", 2))
                         .then(CommandManager.argument("player", StringArgumentType.word())
                             .executes(InventoryRestoreFeature::manualBackup)
                         )
                     )
                     .then(CommandManager.literal("restore")
-                        .requires(source -> Permissions.check(source, "safeslot.command.restore") || source.hasPermissionLevel(2))
+                        .requires(source -> Permissions.check(source, "safeslot.command.restore", 2))
                         .then(CommandManager.argument("player", StringArgumentType.word())
                             .executes(ctx -> restoreBackup(ctx, 1))
                             .then(CommandManager.argument("backup", StringArgumentType.word())
@@ -73,7 +74,7 @@ public class InventoryRestoreFeature {
                         )
                     )
                     .then(CommandManager.literal("cleanup")
-                        .requires(source -> Permissions.check(source, "safeslot.command.cleanup") || source.hasPermissionLevel(2))
+                        .requires(source -> Permissions.check(source, "safeslot.command.cleanup", 2))
                         .executes(InventoryRestoreFeature::cleanupBackups)
                     )
                 )
@@ -93,7 +94,7 @@ public class InventoryRestoreFeature {
     private static void backupPlayerInventory(ServerPlayerEntity player) {
         NbtCompound backup = new NbtCompound();
         NbtList items = new NbtList();
-        RegistryWrapper.WrapperLookup registryManager = player.getServer().getRegistryManager();
+        RegistryWrapper.WrapperLookup registryManager = ((ServerPlayerEntityAccessor)player).getServer().getRegistryManager();
         
         for (int i = 0; i < player.getInventory().size(); i++) {
             ItemStack stack = player.getInventory().getStack(i);
@@ -180,7 +181,7 @@ public class InventoryRestoreFeature {
         context.getSource().sendFeedback(() -> Text.literal("[Safeslot] Backups for " + playerName + ":"), false);
         int idx = 1;
         for (NbtCompound backup : backups) {
-            long ts = backup.getLong("timestamp");
+            long ts = backup.getLong("timestamp").orElse(0L);
             final int displayIdx = idx;
             context.getSource().sendFeedback(() -> Text.literal("  [" + displayIdx + "] " + new Date(ts)), false);
             idx++;
@@ -220,18 +221,18 @@ public class InventoryRestoreFeature {
             return 0;
         }
         NbtCompound backup = backups.get(backupNum - 1);
-        NbtList items = backup.getList("items", 10); // 10 = NbtCompound
-        RegistryWrapper.WrapperLookup registryManager = player.getServer().getRegistryManager();
+        NbtList items = backup.getList("items").orElse(new NbtList());
+        RegistryWrapper.WrapperLookup registryManager = ((ServerPlayerEntityAccessor)player).getServer().getRegistryManager();
         
         player.getInventory().clear();
         for (int i = 0; i < items.size(); i++) {
-            NbtCompound itemNbt = items.getCompound(i);
-            int slot = itemNbt.getInt("Slot");
+            NbtCompound itemNbt = items.getCompound(i).orElse(new NbtCompound());
+            int slot = itemNbt.getInt("Slot").orElse(0);
             ItemStack stack = NbtCompatHelper.itemStackFromNbt(itemNbt, registryManager);
             player.getInventory().setStack(slot, stack);
         }
         // Trinket support: restore trinket slots if Trinkets mod is present (reflection)
-        NbtCompound trinkets = backup.getCompound("trinkets");
+        NbtCompound trinkets = backup.getCompound("trinkets").orElse(new NbtCompound());
         try {
             Class<?> trinketsApi = Class.forName("dev.emi.trinkets.api.TrinketsApi");
             java.lang.reflect.Method getTrinketComponent = trinketsApi.getMethod("getTrinketComponent", ServerPlayerEntity.class);
