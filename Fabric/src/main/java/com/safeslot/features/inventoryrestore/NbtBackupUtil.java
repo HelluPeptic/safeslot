@@ -8,7 +8,8 @@ import com.google.gson.JsonElement;
 import com.google.gson.JsonParser;
 
 import net.minecraft.nbt.NbtCompound;
-import net.minecraft.nbt.StringNbtReader;
+import net.minecraft.nbt.NbtElement;
+import net.minecraft.nbt.NbtHelper;
 
 public class NbtBackupUtil {
     // Serialize a list of NbtCompound (backups) to JSON
@@ -32,10 +33,14 @@ public class NbtBackupUtil {
         return result;
     }
 
-    // Parse NBT from string (vanilla format)
+    // Parse NBT from string (vanilla format) - updated for 1.21.11
     private static NbtCompound parseNbt(String nbtStr) {
         try {
-            return StringNbtReader.parse(nbtStr);
+            NbtElement element = NbtHelper.fromNbtProviderString(nbtStr);
+            if (element instanceof NbtCompound) {
+                return (NbtCompound) element;
+            }
+            return new NbtCompound();
         } catch (Exception e) {
             return new NbtCompound();
         }

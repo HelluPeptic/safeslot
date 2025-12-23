@@ -19,6 +19,7 @@ import net.minecraft.server.command.CommandManager;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.command.ServerCommandSource;
 import net.minecraft.server.network.ServerPlayerEntity;
+import net.minecraft.registry.RegistryWrapper;
 
 import me.lucko.fabric.api.permissions.v0.Permissions;
 import net.fabricmc.fabric.api.command.v2.CommandRegistrationCallback;
@@ -27,6 +28,8 @@ import net.fabricmc.fabric.api.networking.v1.ServerPlayConnectionEvents;
 import com.mojang.brigadier.Command;
 import com.mojang.brigadier.arguments.StringArgumentType;
 import com.mojang.brigadier.context.CommandContext;
+
+import com.safeslot.util.NbtCompatHelper;
 
 public class InventoryRestoreFeature {
     private static final Map<UUID, List<NbtCompound>> playerBackups = new HashMap<>();
@@ -90,11 +93,12 @@ public class InventoryRestoreFeature {
     private static void backupPlayerInventory(ServerPlayerEntity player) {
         NbtCompound backup = new NbtCompound();
         NbtList items = new NbtList();
+        RegistryWrapper.WrapperLookup registryManager = player.getServer().getRegistryManager();
+        
         for (int i = 0; i < player.getInventory().size(); i++) {
             ItemStack stack = player.getInventory().getStack(i);
             if (!stack.isEmpty()) {
-                NbtCompound itemNbt = new NbtCompound();
-                stack.writeNbt(itemNbt);
+                NbtCompound itemNbt = NbtCompatHelper.itemStackToNbt(stack, registryManager);
                 itemNbt.putInt("Slot", i);
                 items.add(itemNbt);
             }
@@ -217,11 +221,13 @@ public class InventoryRestoreFeature {
         }
         NbtCompound backup = backups.get(backupNum - 1);
         NbtList items = backup.getList("items", 10); // 10 = NbtCompound
+        RegistryWrapper.WrapperLookup registryManager = player.getServer().getRegistryManager();
+        
         player.getInventory().clear();
         for (int i = 0; i < items.size(); i++) {
             NbtCompound itemNbt = items.getCompound(i);
             int slot = itemNbt.getInt("Slot");
-            ItemStack stack = ItemStack.fromNbt(itemNbt);
+            ItemStack stack = NbtCompatHelper.itemStackFromNbt(itemNbt, registryManager);
             player.getInventory().setStack(slot, stack);
         }
         // Trinket support: restore trinket slots if Trinkets mod is present (reflection)
