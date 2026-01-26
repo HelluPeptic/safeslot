@@ -36,6 +36,48 @@ public class InventoryRestoreFeature {
     private static final int MAX_BACKUPS = 20;
     private static final Path BACKUP_DIR = Path.of("config", "Safeslot", "inventorybackups");
 
+    // BattleCore compatibility
+    private static Boolean battleCorePresent = null;
+    
+    /**
+     * Check if BattleCore mod is present
+     */
+    private static boolean isBattleCorePresent() {
+        if (battleCorePresent == null) {
+            try {
+                Class.forName("com.battlecore.battle.Battle");
+                battleCorePresent = true;
+            } catch (ClassNotFoundException e) {
+                battleCorePresent = false;
+            }
+        }
+        return battleCorePresent;
+    }
+    
+    /**
+     * Check if player is in an active BattleCore battle
+     */
+    private static boolean isPlayerInBattle(ServerPlayerEntity player) {
+        if (!isBattleCorePresent()) {
+            return false;
+        }
+        try {
+            Class<?> battleClass = Class.forName("com.battlecore.battle.Battle");
+            Object battle = battleClass.getMethod("getInstance").invoke(null);
+            Object state = battleClass.getMethod("getState").invoke(battle);
+            
+            // Check if battle is active (not INACTIVE)
+            if (!state.toString().equals("INACTIVE")) {
+                Boolean inBattle = (Boolean) battleClass.getMethod("isPlayerInBattle", java.util.UUID.class)
+                    .invoke(battle, player.getUuid());
+                return inBattle != null && inBattle;
+            }
+        } catch (Exception e) {
+            // If we can't check, assume not in battle
+        }
+        return false;
+    }
+
     public static void register() {
         CommandRegistrationCallback.EVENT.register((dispatcher, registryAccess, environment) -> {
             dispatcher.register(CommandManager.literal("safeslot")
@@ -89,6 +131,11 @@ public class InventoryRestoreFeature {
 
     // Enhanced inventory backup with full slot preservation and mod support
     private static void backupPlayerInventory(ServerPlayerEntity player) {
+        // Don't backup if player is in BattleCore battle - let BattleCore handle inventory
+        if (isPlayerInBattle(player)) {
+            return;
+        }
+        
         NbtCompound backup = new NbtCompound();
         RegistryWrapper.WrapperLookup registryManager = ((ServerPlayerEntityAccessor)player).getServer().getRegistryManager();
         
@@ -303,8 +350,18 @@ public class InventoryRestoreFeature {
                 
                 if (!cleanItemNbt.isEmpty()) {
                     ItemStack stack = NbtCompatHelper.itemStackFromNbt(cleanItemNbt, registryManager);
-                    if (slot >= 0 && slot < player.getInventory().size()) {
-                        player.getInventory().setStack(slot, stack);
+                    if (slot >= 0 && slot <= 46) {
+                        try {
+                            player.getInventory().setStack(slot, stack);
+                        } catch (IndexOutOfBoundsException e) {
+                            // If slot doesn't exist, try to place in main inventory
+                            for (int fallbackSlot = 0; fallbackSlot < 36; fallbackSlot++) {
+                                if (player.getInventory().getStack(fallbackSlot).isEmpty()) {
+                                    player.getInventory().setStack(fallbackSlot, stack);
+                                    break;
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -318,19 +375,29 @@ public class InventoryRestoreFeature {
             // Clear current inventory
             player.getInventory().clear();
             
-            // Restore items with slot validation
+            // Restore items with expanded slot validation
             for (int i = 0; i < items.size(); i++) {
                 NbtCompound itemNbt = items.getCompound(i).orElse(new NbtCompound());
                 int slot = itemNbt.getInt("Slot").orElse(0);
                 boolean hasItem = itemNbt.getBoolean("HasItem").orElse(false);
                 
-                // Validate slot is within current inventory size
-                if (slot >= 0 && slot < currentInventorySize) {
+                // Allow all reasonable slots including armor (36-39), offhand (40), and modded slots (up to 46 for Nemo's backpack)
+                if (slot >= 0 && slot <= 46) {
                     if (hasItem && itemNbt.contains("ItemData")) {
                         NbtCompound stackNbt = itemNbt.getCompound("ItemData").orElse(new NbtCompound());
                         ItemStack stack = NbtCompatHelper.itemStackFromNbt(stackNbt, registryManager);
                         if (!stack.isEmpty()) {
-                            player.getInventory().setStack(slot, stack);
+                            try {
+                                player.getInventory().setStack(slot, stack);
+                            } catch (IndexOutOfBoundsException e) {
+                                // If slot doesn't exist in this inventory, try to place in main inventory
+                                for (int fallbackSlot = 0; fallbackSlot < 36; fallbackSlot++) {
+                                    if (player.getInventory().getStack(fallbackSlot).isEmpty()) {
+                                        player.getInventory().setStack(fallbackSlot, stack);
+                                        break;
+                                    }
+                                }
+                            }
                         }
                     }
                     // Empty slots are automatically handled by clear() above
