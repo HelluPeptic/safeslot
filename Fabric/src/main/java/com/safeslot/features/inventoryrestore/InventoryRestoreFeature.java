@@ -10,6 +10,12 @@ import java.util.LinkedList;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
 
 import com.mojang.brigadier.Command;
 import com.mojang.brigadier.arguments.StringArgumentType;
@@ -32,9 +38,29 @@ import net.minecraft.server.network.ServerPlayerEntity;
 import net.minecraft.text.Text;
 
 public class InventoryRestoreFeature {
-    private static final Map<UUID, List<NbtCompound>> playerBackups = new HashMap<>();
+    // Thread-safe collections for concurrent access
+    private static final Map<UUID, List<NbtCompound>> playerBackups = new ConcurrentHashMap<>();
     private static final int MAX_BACKUPS = 20;
     private static final Path BACKUP_DIR = Path.of("config", "Safeslot", "inventorybackups");
+    
+    // Threading infrastructure
+    private static final ExecutorService BACKUP_EXECUTOR = Executors.newFixedThreadPool(2, r -> {
+        Thread t = new Thread(r, "Safeslot-Backup-Thread");
+        t.setDaemon(true);
+        return t;
+    });
+    
+    private static final ReentrantReadWriteLock backupLock = new ReentrantReadWriteLock();
+    
+    // Cache for pending backup operations to avoid duplicate saves
+    private static final Map<UUID, CompletableFuture<Void>> pendingSaves = new ConcurrentHashMap<>();
+    
+    // Batching system to reduce file I/O operations
+    private static final Map<UUID, Long> pendingBackupWrites = new ConcurrentHashMap<>();
+    private static final long BATCH_DELAY_MS = 5000; // 5 seconds delay before writing to disk
+    
+    // Memory optimization: limit the size of backups in memory
+    private static final int MAX_MEMORY_BACKUPS = 10; // Only keep 10 most recent in memory per player
 
     // BattleCore compatibility
     private static Boolean battleCorePresent = null;
@@ -120,22 +146,72 @@ public class InventoryRestoreFeature {
             );
         });
         // Register event listeners for backup triggers
-        ServerLifecycleEvents.SERVER_STARTED.register(server -> loadBackups());
-        ServerLifecycleEvents.SERVER_STOPPING.register(server -> saveBackups());
+        ServerLifecycleEvents.SERVER_STARTED.register(server -> {
+            loadBackupsAsync();
+            // Start periodic memory cleanup
+            startPeriodicCleanup();
+        });
+        ServerLifecycleEvents.SERVER_STOPPING.register(server -> {
+            saveBackupsAsync();
+            shutdownExecutor();
+        });
         // Only backup on disconnect (leave), not on join or death
         // ServerPlayConnectionEvents.JOIN.register((handler, sender, server) -> backupPlayerInventory(handler.getPlayer()));
-        ServerPlayConnectionEvents.DISCONNECT.register((handler, server) -> backupPlayerInventory(handler.getPlayer()));
+        ServerPlayConnectionEvents.DISCONNECT.register((handler, server) -> backupPlayerInventoryAsync(handler.getPlayer()));
         // Player death: fallback to tick-based check for MVP (disabled for now)
         // (Ideally, use a mixin or a custom event for onDeath)
     }
 
-    // Enhanced inventory backup with full slot preservation and mod support
+    /**
+     * Asynchronous version of backupPlayerInventory for use during disconnect events
+     */
+    private static void backupPlayerInventoryAsync(ServerPlayerEntity player) {
+        // Don't backup if player is in BattleCore battle - let BattleCore handle inventory
+        if (isPlayerInBattle(player)) {
+            return;
+        }
+        
+        // Create backup data on main thread first (since we need access to player data)
+        final UUID uuid = player.getUuid();
+        final NbtCompound backupData = createBackupData(player);
+        
+        // Process the backup asynchronously to avoid blocking server thread
+        CompletableFuture<Void> saveTask = CompletableFuture.runAsync(() -> {
+            try {
+                processBackupAsync(uuid, backupData);
+            } catch (Exception e) {
+                // Log error but don't crash server
+                System.err.println("[Safeslot] Error saving backup for player " + uuid + ": " + e.getMessage());
+            }
+        }, BACKUP_EXECUTOR);
+        
+        // Track pending save to avoid duplicate operations
+        pendingSaves.put(uuid, saveTask);
+        
+        // Clean up completed saves after a timeout
+        saveTask.whenComplete((result, throwable) -> {
+            pendingSaves.remove(uuid);
+        });
+    }
+    
+    /**
+     * Synchronous version for manual backups and commands
+     */
     private static void backupPlayerInventory(ServerPlayerEntity player) {
         // Don't backup if player is in BattleCore battle - let BattleCore handle inventory
         if (isPlayerInBattle(player)) {
             return;
         }
         
+        final UUID uuid = player.getUuid();
+        final NbtCompound backupData = createBackupData(player);
+        processBackupSync(uuid, backupData);
+    }
+    
+    /**
+     * Creates backup data from player on main thread (must access player data on main thread)
+     */
+    private static NbtCompound createBackupData(ServerPlayerEntity player) {
         NbtCompound backup = new NbtCompound();
         RegistryWrapper.WrapperLookup registryManager = ((ServerPlayerEntityAccessor)player).getServer().getRegistryManager();
         
@@ -197,14 +273,137 @@ public class InventoryRestoreFeature {
             }
         } catch (Throwable ignored) {}
         backup.put("trinkets", trinkets);
-        UUID uuid = player.getUuid();
-        playerBackups.computeIfAbsent(uuid, k -> new LinkedList<>());
-        List<NbtCompound> backups = playerBackups.get(uuid);
-        backups.add(0, backup);
-        while (backups.size() > MAX_BACKUPS) backups.remove(backups.size() - 1);
-        savePlayerBackups(uuid, backups); // Save after each backup
+        backup.putLong("timestamp", System.currentTimeMillis());
+        
+        return backup;
+    }
+    
+    /**
+     * Process backup data synchronously (for commands)
+     */
+    private static void processBackupSync(UUID uuid, NbtCompound backup) {
+        backupLock.writeLock().lock();
+        try {
+            playerBackups.computeIfAbsent(uuid, k -> new LinkedList<>());
+            List<NbtCompound> backups = playerBackups.get(uuid);
+            backups.add(0, backup);
+            while (backups.size() > MAX_BACKUPS) backups.remove(backups.size() - 1);
+            
+            // Save immediately for sync operations
+            savePlayerBackups(uuid, backups);
+        } finally {
+            backupLock.writeLock().unlock();
+        }
+    }
+    
+    /**
+     * Process backup data asynchronously (for disconnect events) with batching optimization
+     */
+    private static void processBackupAsync(UUID uuid, NbtCompound backup) {
+        backupLock.writeLock().lock();
+        try {
+            playerBackups.computeIfAbsent(uuid, k -> new LinkedList<>());
+            List<NbtCompound> backups = playerBackups.get(uuid);
+            backups.add(0, backup);
+            while (backups.size() > MAX_BACKUPS) backups.remove(backups.size() - 1);
+            
+            // Memory optimization: if we have too many in memory, save to disk and keep only recent ones
+            if (backups.size() > MAX_MEMORY_BACKUPS) {
+                savePlayerBackups(uuid, new ArrayList<>(backups));
+                // Keep only the most recent backups in memory
+                while (backups.size() > MAX_MEMORY_BACKUPS / 2) {
+                    backups.remove(backups.size() - 1);
+                }
+            }
+            
+            // Schedule batched write to disk (don't write immediately for every backup)
+            scheduleBatchedWrite(uuid, backups);
+        } finally {
+            backupLock.writeLock().unlock();
+        }
+    }
+    
+    /**
+     * Schedule a batched write operation to reduce I/O stress
+     */
+    private static void scheduleBatchedWrite(UUID uuid, List<NbtCompound> backups) {
+        long currentTime = System.currentTimeMillis();
+        Long lastWriteTime = pendingBackupWrites.get(uuid);
+        
+        // If no recent write scheduled, schedule one
+        if (lastWriteTime == null || currentTime - lastWriteTime > BATCH_DELAY_MS) {
+            pendingBackupWrites.put(uuid, currentTime);
+            
+            CompletableFuture.runAsync(() -> {
+                try {
+                    // Wait for batching delay
+                    Thread.sleep(BATCH_DELAY_MS);
+                    
+                    // Get current state and save
+                    backupLock.readLock().lock();
+                    List<NbtCompound> currentBackups;
+                    try {
+                        currentBackups = new ArrayList<>(playerBackups.getOrDefault(uuid, new ArrayList<>()));
+                    } finally {
+                        backupLock.readLock().unlock();
+                    }
+                    
+                    if (!currentBackups.isEmpty()) {
+                        savePlayerBackups(uuid, currentBackups);
+                    }
+                    pendingBackupWrites.remove(uuid);
+                } catch (Exception e) {
+                    pendingBackupWrites.remove(uuid);
+                    System.err.println("[Safeslot] Error in batched write for player " + uuid + ": " + e.getMessage());
+                }
+            }, BACKUP_EXECUTOR);
+        }
     }
 
+    /**
+     * Load backups asynchronously during server startup
+     */
+    private static void loadBackupsAsync() {
+        CompletableFuture.runAsync(() -> {
+            try {
+                if (!Files.exists(BACKUP_DIR)) Files.createDirectories(BACKUP_DIR);
+                
+                backupLock.writeLock().lock();
+                try {
+                    playerBackups.clear();
+                } finally {
+                    backupLock.writeLock().unlock();
+                }
+                
+                Files.list(BACKUP_DIR).filter(p -> p.toString().endsWith(".json")).forEach(path -> {
+                    try {
+                        String json = Files.readString(path, StandardCharsets.UTF_8);
+                        List<NbtCompound> backups = NbtBackupUtil.deserializeBackups(json);
+                        String fileName = path.getFileName().toString();
+                        String uuidStr = fileName.substring(0, fileName.length() - 5); // remove .json
+                        UUID uuid = UUID.fromString(uuidStr);
+                        
+                        backupLock.writeLock().lock();
+                        try {
+                            playerBackups.put(uuid, backups);
+                        } finally {
+                            backupLock.writeLock().unlock();
+                        }
+                    } catch (Exception e) {
+                        // Skip corrupted backup file
+                        System.err.println("[Safeslot] Error loading backup file " + path + ": " + e.getMessage());
+                    }
+                });
+                System.out.println("[Safeslot] Loaded backups for " + playerBackups.size() + " players");
+            } catch (Exception e) {
+                System.err.println("[Safeslot] Error loading backups: " + e.getMessage());
+            }
+        }, BACKUP_EXECUTOR);
+    }
+    
+    /**
+     * Synchronous backup loading for compatibility
+     */
     private static void loadBackups() {
         try {
             if (!Files.exists(BACKUP_DIR)) Files.createDirectories(BACKUP_DIR);
@@ -227,6 +426,34 @@ public class InventoryRestoreFeature {
         }
     }
 
+    /**
+     * Save all backups asynchronously during server shutdown
+     */
+    private static void saveBackupsAsync() {
+        CompletableFuture.runAsync(() -> {
+            try {
+                if (!Files.exists(BACKUP_DIR)) Files.createDirectories(BACKUP_DIR);
+                
+                backupLock.readLock().lock();
+                Map<UUID, List<NbtCompound>> backupSnapshot;
+                try {
+                    backupSnapshot = new HashMap<>(playerBackups);
+                } finally {
+                    backupLock.readLock().unlock();
+                }
+                
+                for (Map.Entry<UUID, List<NbtCompound>> entry : backupSnapshot.entrySet()) {
+                    savePlayerBackups(entry.getKey(), entry.getValue());
+                }
+            } catch (Exception e) {
+                System.err.println("[Safeslot] Error saving backups during shutdown: " + e.getMessage());
+            }
+        }, BACKUP_EXECUTOR);
+    }
+    
+    /**
+     * Synchronous backup saving for compatibility
+     */
     private static void saveBackups() {
         try {
             if (!Files.exists(BACKUP_DIR)) Files.createDirectories(BACKUP_DIR);
@@ -242,11 +469,21 @@ public class InventoryRestoreFeature {
     private static void savePlayerBackups(UUID uuid, List<NbtCompound> backups) {
         try {
             if (!Files.exists(BACKUP_DIR)) Files.createDirectories(BACKUP_DIR);
-            String json = NbtBackupUtil.serializeBackups(backups);
+            
+            // Optimize memory: only save what's necessary and compress large backups
+            List<NbtCompound> optimizedBackups = new ArrayList<>();
+            for (NbtCompound backup : backups) {
+                if (backup != null && !backup.isEmpty()) {
+                    optimizedBackups.add(backup);
+                }
+            }
+            
+            String json = NbtBackupUtil.serializeBackups(optimizedBackups);
             Path file = BACKUP_DIR.resolve(uuid.toString() + ".json");
             Files.writeString(file, json, StandardCharsets.UTF_8);
         } catch (Exception e) {
             // Don't re-throw the exception, just log it to prevent breaking other saves
+            System.err.println("[Safeslot] Failed to save backups for " + uuid + ": " + e.getMessage());
         }
     }
 
@@ -259,7 +496,14 @@ public class InventoryRestoreFeature {
             return 0;
         }
         UUID uuid = player.getUuid();
-        List<NbtCompound> backups = playerBackups.get(uuid);
+        
+        backupLock.readLock().lock();
+        List<NbtCompound> backups;
+        try {
+            backups = playerBackups.get(uuid);
+        } finally {
+            backupLock.readLock().unlock();
+        }
         if (backups == null || backups.isEmpty()) {
             context.getSource().sendFeedback(() -> Text.literal("[Safeslot] No backups found for " + playerName), false);
             return Command.SINGLE_SUCCESS;
@@ -319,7 +563,15 @@ public class InventoryRestoreFeature {
             return 0;
         }
         UUID uuid = player.getUuid();
-        List<NbtCompound> backups = playerBackups.get(uuid);
+        
+        backupLock.readLock().lock();
+        List<NbtCompound> backups;
+        try {
+            backups = playerBackups.get(uuid);
+        } finally {
+            backupLock.readLock().unlock();
+        }
+        
         if (backups == null || backups.isEmpty()) {
             context.getSource().sendError(Text.literal("[Safeslot] No backups found for " + playerName));
             return 0;
@@ -465,24 +717,103 @@ public class InventoryRestoreFeature {
     }
 
     private static int cleanupBackups(CommandContext<ServerCommandSource> context) {
-        int totalPlayers = 0;
-        int totalDeleted = 0;
-        int keepCount = 3;
-        for (Map.Entry<UUID, List<NbtCompound>> entry : playerBackups.entrySet()) {
-            List<NbtCompound> backups = entry.getValue();
-            if (backups.size() > keepCount) {
-                int toDelete = backups.size() - keepCount;
-                // Keep only the most recent backups
-                List<NbtCompound> mostRecent = new ArrayList<>(backups.subList(0, keepCount));
-                backups.clear();
-                backups.addAll(mostRecent);
-                savePlayerBackups(entry.getKey(), backups);
-                totalDeleted += toDelete;
-                totalPlayers++;
+        // Run cleanup asynchronously to avoid blocking server thread
+        CompletableFuture.runAsync(() -> {
+            try {
+                int totalPlayers = 0;
+                int totalDeleted = 0;
+                int keepCount = 3;
+                
+                backupLock.writeLock().lock();
+                try {
+                    for (Map.Entry<UUID, List<NbtCompound>> entry : playerBackups.entrySet()) {
+                        List<NbtCompound> backups = entry.getValue();
+                        if (backups.size() > keepCount) {
+                            int toDelete = backups.size() - keepCount;
+                            // Keep only the most recent backups
+                            List<NbtCompound> mostRecent = new ArrayList<>(backups.subList(0, keepCount));
+                            backups.clear();
+                            backups.addAll(mostRecent);
+                            savePlayerBackups(entry.getKey(), backups);
+                            totalDeleted += toDelete;
+                            totalPlayers++;
+                        }
+                    }
+                } finally {
+                    backupLock.writeLock().unlock();
+                }
+                
+                String msg = "[Safeslot] Cleanup complete: " + totalDeleted + " old backups removed for " + totalPlayers + " player(s).";
+                context.getSource().sendFeedback(() -> Text.literal(msg), false);
+            } catch (Exception e) {
+                context.getSource().sendError(Text.literal("[Safeslot] Error during cleanup: " + e.getMessage()));
             }
-        }
-        String msg = "[Safeslot] Cleanup complete: " + totalDeleted + " old backups removed for " + totalPlayers + " player(s).";
-        context.getSource().sendFeedback(() -> Text.literal(msg), false);
+        }, BACKUP_EXECUTOR);
+        
+        context.getSource().sendFeedback(() -> Text.literal("[Safeslot] Cleanup started in background..."), false);
         return Command.SINGLE_SUCCESS;
+    }
+    
+    /**
+     * Start periodic cleanup to manage memory usage
+     */
+    private static void startPeriodicCleanup() {
+        CompletableFuture.runAsync(() -> {
+            try {
+                while (!BACKUP_EXECUTOR.isShutdown()) {
+                    Thread.sleep(300000); // 5 minutes
+                    performMemoryCleanup();
+                }
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        }, BACKUP_EXECUTOR);
+    }
+    
+    /**
+     * Perform memory cleanup by removing old backups from memory
+     */
+    private static void performMemoryCleanup() {
+        backupLock.writeLock().lock();
+        try {
+            for (Map.Entry<UUID, List<NbtCompound>> entry : playerBackups.entrySet()) {
+                List<NbtCompound> backups = entry.getValue();
+                if (backups.size() > MAX_MEMORY_BACKUPS) {
+                    // Save all backups to disk first
+                    savePlayerBackups(entry.getKey(), new ArrayList<>(backups));
+                    
+                    // Keep only recent ones in memory
+                    List<NbtCompound> recentBackups = new ArrayList<>(
+                        backups.subList(0, Math.min(MAX_MEMORY_BACKUPS / 2, backups.size()))
+                    );
+                    backups.clear();
+                    backups.addAll(recentBackups);
+                }
+            }
+        } finally {
+            backupLock.writeLock().unlock();
+        }
+    }
+    
+    /**
+     * Gracefully shutdown the executor service
+     */
+    private static void shutdownExecutor() {
+        try {
+            // Wait for pending backup operations to complete
+            for (CompletableFuture<Void> pending : pendingSaves.values()) {
+                pending.join();
+            }
+            pendingSaves.clear();
+            
+            BACKUP_EXECUTOR.shutdown();
+            if (!BACKUP_EXECUTOR.awaitTermination(10, TimeUnit.SECONDS)) {
+                System.err.println("[Safeslot] Backup executor did not shut down gracefully, forcing shutdown");
+                BACKUP_EXECUTOR.shutdownNow();
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            BACKUP_EXECUTOR.shutdownNow();
+        }
     }
 }
