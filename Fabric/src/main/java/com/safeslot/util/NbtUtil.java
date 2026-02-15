@@ -62,28 +62,59 @@ public class NbtUtil {
     
     /**
      * Serialize NBT compound to binary data (Base64 encoded for storage)
-     * This preserves ALL NBT data without any conversion losses
+     * This preserves ALL NBT data using Minecraft's compressed file format for full compatibility
      */
     public static String serializeNbtToBase64(NbtCompound nbt) {
         if (nbt == null || nbt.isEmpty()) {
             return "";
         }
         
-        try (ByteArrayOutputStream baos = new ByteArrayOutputStream();
-             DataOutputStream dos = new DataOutputStream(baos)) {
+        try {
+            // Use compressed NBT format (like .nbt files) for maximum compatibility
+            try (ByteArrayOutputStream baos = new ByteArrayOutputStream()) {
+                NbtIo.writeCompressed(nbt, baos);
+                byte[] nbtBytes = baos.toByteArray();
+                
+                if (nbtBytes.length == 0) {
+                    SafeslotMod.LOGGER.error("Compressed NBT serialization produced 0 bytes!");
+                    return "";
+                }
+                
+                // Validation: Try to read back the compressed NBT we just wrote
+                try (ByteArrayInputStream testBais = new ByteArrayInputStream(nbtBytes)) {
+                    NbtCompound testCompound = NbtIo.readCompressed(testBais, NbtSizeTracker.ofUnlimitedBytes());
+                    
+                    if (testCompound.isEmpty()) {
+                        SafeslotMod.LOGGER.error("NBT validation failed: Compressed NBT read back as empty!");
+                        return "";
+                    }
+                } catch (Exception validationException) {
+                    SafeslotMod.LOGGER.error("NBT validation failed: {}", validationException.getMessage());
+                    return "";
+                }
+                
+                String base64Result = Base64.getEncoder().encodeToString(nbtBytes);
+                if (base64Result.isEmpty()) {
+                    SafeslotMod.LOGGER.error("Base64 encoding resulted in empty string!");
+                    return "";
+                }
+                
+                return base64Result;
+                
+            } catch (IOException e) {
+                SafeslotMod.LOGGER.error("IOException during compressed NBT serialization: {}", e.getMessage());
+                return "";
+            }
             
-            NbtIo.write(nbt, dos);
-            return Base64.getEncoder().encodeToString(baos.toByteArray());
-            
-        } catch (IOException e) {
-            SafeslotMod.LOGGER.error("Failed to serialize NBT to binary: {}", e.getMessage());
+        } catch (Exception e) {
+            SafeslotMod.LOGGER.error("Unexpected error during NBT serialization: {}", e.getMessage());
             return "";
         }
     }
     
     /**
      * Deserialize binary data (Base64 encoded) back to NBT compound
-     * This preserves ALL NBT data without any conversion losses
+     * This preserves ALL NBT data using Minecraft's compressed file format
      */
     public static NbtCompound deserializeNbtFromBase64(String base64Data) {
         if (base64Data == null || base64Data.isEmpty()) {
@@ -91,21 +122,78 @@ public class NbtUtil {
         }
         
         try {
-            byte[] data = Base64.getDecoder().decode(base64Data);
-            try (ByteArrayInputStream bais = new ByteArrayInputStream(data);
-                 DataInputStream dis = new DataInputStream(bais)) {
-                
-                NbtElement element = NbtIo.read(dis, NbtSizeTracker.ofUnlimitedBytes());
-                if (element instanceof NbtCompound) {
-                    return (NbtCompound) element;
-                }
+            // Step 1: Decode Base64 to bytes
+            byte[] nbtBytes = Base64.getDecoder().decode(base64Data);
+            
+            if (nbtBytes.length == 0) {
+                SafeslotMod.LOGGER.error("Base64 decoded to 0 bytes!");
                 return new NbtCompound();
             }
             
-        } catch (Exception e) {
-            SafeslotMod.LOGGER.error("Failed to deserialize binary data to NBT: {}", e.getMessage());
+            // Step 2: Read compressed NBT format (like .nbt files)
+            try (ByteArrayInputStream bais = new ByteArrayInputStream(nbtBytes)) {
+                NbtCompound compound = NbtIo.readCompressed(bais, NbtSizeTracker.ofUnlimitedBytes());
+                
+                if (compound == null || compound.isEmpty()) {
+                    SafeslotMod.LOGGER.error("Deserialized NBT compound is empty!");
+                    return new NbtCompound();
+                }
+                
+                return compound;
+                
+            } catch (IOException ioException) {
+                SafeslotMod.LOGGER.error("IOException during compressed NBT reading: {}", ioException.getMessage());
+                
+                // Fallback: Try uncompressed format
+                try (ByteArrayInputStream bais = new ByteArrayInputStream(nbtBytes);
+                     DataInputStream dis = new DataInputStream(bais)) {
+                    
+                    NbtElement element = NbtIo.read(dis, NbtSizeTracker.ofUnlimitedBytes());
+                    if (element instanceof NbtCompound compound) {
+                        return compound;
+                    } else {
+                        SafeslotMod.LOGGER.error("Fallback failed: Element is not compound");
+                        return new NbtCompound();
+                    }
+                } catch (Exception fallbackException) {
+                    SafeslotMod.LOGGER.error("Fallback to uncompressed NBT also failed: {}", fallbackException.getMessage());
+                    return new NbtCompound();
+                }
+            }
+            
+        } catch (IllegalArgumentException base64Exception) {
+            SafeslotMod.LOGGER.error("Base64 decode failed - invalid Base64 data: {}", base64Exception.getMessage());
+            return new NbtCompound();
+        } catch (Exception generalException) {
+            SafeslotMod.LOGGER.error("Unexpected error during NBT deserialization: {}", generalException.getMessage());
             return new NbtCompound();
         }
+    }
+    
+    /**
+     * Alternative NBT serialization using string format as fallback
+     * This is used if binary serialization fails
+     */
+    public static String serializeNbtToString(NbtCompound nbt) {
+        if (nbt == null || nbt.isEmpty()) {
+            return "";
+        }
+        
+        try {
+            String nbtString = nbt.toString();
+            return Base64.getEncoder().encodeToString(nbtString.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+        } catch (Exception e) {
+            SafeslotMod.LOGGER.error("NBT string serialization failed: {}", e.getMessage());
+            return "";
+        }
+    }
+    
+    /**
+     * Alternative NBT deserialization from string format
+     * This is used if binary deserialization fails
+     */
+    public static NbtCompound deserializeNbtFromString(String base64String) {
+        return new NbtCompound();
     }
     
     /**

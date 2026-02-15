@@ -1,8 +1,8 @@
 package com.safeslot.inventory;
 
-import net.minecraft.nbt.NbtCompound;
-
 import java.util.UUID;
+
+import net.minecraft.nbt.NbtCompound;
 
 /**
  * Data class representing a complete player inventory backup
@@ -80,7 +80,7 @@ public class PlayerBackup {
      * Get a human-readable summary of this backup
      */
     public String getSummary() {
-        int totalItems = com.safeslot.util.NbtUtil.getInt(inventoryData, "totalItemsBackedUp");
+        int totalItems = getEstimatedItemCount();
         boolean hasBackpack = hasBackpackData();
         
         StringBuilder summary = new StringBuilder();
@@ -93,6 +93,30 @@ public class PlayerBackup {
         summary.append(String.format(" (from %s)", new java.util.Date(timestamp)));
         
         return summary.toString();
+    }
+    
+    /**
+     * Get the estimated number of items in this backup
+     */
+    public int getEstimatedItemCount() {
+        // Get count from inventory data
+        int inventoryItems = com.safeslot.util.NbtUtil.getInt(inventoryData, "totalItemsBackedUp");
+        
+        // Add backpack items if present
+        int backpackItems = 0;
+        if (hasBackpackData()) {
+            try {
+                NbtCompound backpackDataNbt = com.safeslot.util.NbtUtil.getCompound(backpackData, "backpackData");
+                if (!backpackDataNbt.isEmpty()) {
+                    // This is a rough estimate - backpack might have items
+                    backpackItems = 1; 
+                }
+            } catch (Exception e) {
+                // Ignore backpack counting errors
+            }
+        }
+        
+        return inventoryItems + backpackItems;
     }
     
     /**

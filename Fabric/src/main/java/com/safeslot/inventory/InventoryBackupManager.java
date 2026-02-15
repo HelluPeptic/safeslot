@@ -149,10 +149,10 @@ public class InventoryBackupManager {
      * Register server and player event handlers
      */
     private static void registerEventHandlers() {
-        // Server startup
+        // Server startup - load backups synchronously
         ServerLifecycleEvents.SERVER_STARTED.register(server -> {
             serverInstance = server;
-            loadAllBackupsAsync();
+            loadAllBackupsSynchronously(); // Fixed: synchronous to prevent race conditions
         });
         
         // Server shutdown
@@ -195,6 +195,8 @@ public class InventoryBackupManager {
      * Create a complete player backup including inventory and Nemo's backpack
      */
     private static PlayerBackup createPlayerBackup(ServerPlayerEntity player, RegistryWrapper.WrapperLookup registries) {
+        SafeslotMod.LOGGER.info("Creating disconnect backup for player: {}", player.getGameProfile().name());
+        
         // Main inventory backup
         NbtCompound inventoryBackup = InventorySlotHandler.createInventoryBackup(player, registries);
         
@@ -209,6 +211,8 @@ public class InventoryBackupManager {
             inventoryBackup,
             backpackBackup
         );
+        
+
         
         return backup;
     }
@@ -456,60 +460,86 @@ public class InventoryBackupManager {
     // (loadAllBackupsAsync, savePlayerBackupsAsync, saveAllBackupsAndShutdown)
     
     /**
-     * Load all backups from disk asynchronously
+     * Load all backups from disk synchronously during startup
      */
-    private static void loadAllBackupsAsync() {
-        CompletableFuture.runAsync(() -> {
-            try {
-                if (!Files.exists(BACKUP_DIRECTORY)) {
-                    return;
-                }
-                
-                backupLock.writeLock().lock();
-                try {
-                    playerBackups.clear();
-                } finally {
-                    backupLock.writeLock().unlock();
-                }
-                
-                Files.list(BACKUP_DIRECTORY)
-                    .filter(path -> path.toString().endsWith(".json"))
-                    .forEach(InventoryBackupManager::loadPlayerBackupFromFile);
-                
-                SafeslotMod.LOGGER.info("Loaded backups for {} players", playerBackups.size());
-                
-            } catch (Exception e) {
-                SafeslotMod.LOGGER.error("Failed to load backups from disk", e);
+    private static void loadAllBackupsSynchronously() {
+        try {
+            SafeslotMod.LOGGER.info("Loading player backups from disk...");
+            
+            if (!Files.exists(BACKUP_DIRECTORY)) {
+                SafeslotMod.LOGGER.info("No backup directory found, starting fresh");
+                return;
             }
-        }, backupExecutor);
+            
+            backupLock.writeLock().lock();
+            try {
+                playerBackups.clear();
+            } finally {
+                backupLock.writeLock().unlock();
+            }
+            
+            int loadedPlayers = 0;
+            int totalBackups = 0;
+            
+            try (var fileStream = Files.list(BACKUP_DIRECTORY)) {
+                for (Path backupFile : fileStream.filter(path -> path.toString().endsWith(".json")).toList()) {
+                    try {
+                        List<PlayerBackup> backups = loadPlayerBackupFromFile(backupFile);
+                        if (!backups.isEmpty()) {
+                            loadedPlayers++;
+                            totalBackups += backups.size();
+                        }
+                    } catch (Exception e) {
+                        SafeslotMod.LOGGER.error("Failed to load backup file {}: {}", backupFile, e.getMessage());
+                    }
+                }
+            }
+            
+            SafeslotMod.LOGGER.info("Successfully loaded {} backups for {} players", totalBackups, loadedPlayers);
+            
+        } catch (Exception e) {
+            SafeslotMod.LOGGER.error("Critical error loading backups from disk", e);
+        }
     }
     
     /**
-     * Load a single player's backup file
+     * Load a single player's backup file and return the backups
      */
-    private static void loadPlayerBackupFromFile(Path backupFile) {
+    private static List<PlayerBackup> loadPlayerBackupFromFile(Path backupFile) {
+        List<PlayerBackup> backups = new ArrayList<>();
+        
         try {
             String fileName = backupFile.getFileName().toString();
             String uuidString = fileName.substring(0, fileName.length() - 5); // Remove .json
             UUID playerUuid = UUID.fromString(uuidString);
             
             String jsonContent = Files.readString(backupFile, StandardCharsets.UTF_8);
-            List<PlayerBackup> backups = deserializePlayerBackups(jsonContent);
+            
+            if (jsonContent.trim().isEmpty()) {
+                SafeslotMod.LOGGER.warn("Empty backup file found: {}", backupFile);
+                return backups;
+            }
+            
+            backups = deserializePlayerBackups(jsonContent);
             
             if (!backups.isEmpty()) {
                 backupLock.writeLock().lock();
                 try {
-                    playerBackups.put(playerUuid, backups);
+                    playerBackups.put(playerUuid, new ArrayList<>(backups));
                 } finally {
                     backupLock.writeLock().unlock();
                 }
+            } else {
+                SafeslotMod.LOGGER.warn("No valid backups found in file: {}", backupFile);
             }
             
         } catch (Exception e) {
-            SafeslotMod.LOGGER.warn("Failed to load backup file {}: {}", backupFile, e.getMessage());
+            SafeslotMod.LOGGER.error("Failed to load player backup from {}: {}", backupFile, e.getMessage(), e);
         }
+        
+        return backups;
     }
-    
+
     /**
      * Save a player's backups to disk asynchronously
      */
@@ -519,10 +549,17 @@ public class InventoryBackupManager {
         CompletableFuture.runAsync(() -> {
             try {
                 String jsonContent = serializePlayerBackups(backupsToSave);
-                Path backupFile = BACKUP_DIRECTORY.resolve(playerUuid.toString() + ".json");
+                if (jsonContent.trim().isEmpty()) {
+                    SafeslotMod.LOGGER.warn("Empty serialization result for player {}, skipping save", playerUuid);
+                    return;
+                }
                 
+                Path backupFile = BACKUP_DIRECTORY.resolve(playerUuid.toString() + ".json");
                 Files.writeString(backupFile, jsonContent, StandardCharsets.UTF_8, 
                     StandardOpenOption.CREATE, StandardOpenOption.WRITE, StandardOpenOption.TRUNCATE_EXISTING);
+                    
+                SafeslotMod.LOGGER.debug("Saved {} backups for player {} (file size: {} bytes)", 
+                    backupsToSave.size(), playerUuid, jsonContent.length());
                     
             } catch (Exception e) {
                 SafeslotMod.LOGGER.error("Failed to save backups for {}: {}", playerUuid, e.getMessage());
@@ -574,21 +611,54 @@ public class InventoryBackupManager {
      * Serialize player backups to JSON with proper binary NBT encoding
      */
     private static String serializePlayerBackups(List<PlayerBackup> backups) {
-        JsonArray jsonArray = new JsonArray();
-        
-        for (PlayerBackup backup : backups) {
-            JsonObject backupJson = new JsonObject();
-            backupJson.addProperty("playerUuid", backup.getPlayerUuid().toString());
-            backupJson.addProperty("playerName", backup.getPlayerName());
-            backupJson.addProperty("timestamp", backup.getTimestamp());
-            
-            // Serialize NBT data as Base64 to preserve all data
-            backupJson.addProperty("inventoryData", com.safeslot.util.NbtUtil.serializeNbtToBase64(backup.getInventoryData()));
-            backupJson.addProperty("backpackData", com.safeslot.util.NbtUtil.serializeNbtToBase64(backup.getBackpackData()));
-            
-            jsonArray.add(backupJson);
+        if (backups == null || backups.isEmpty()) {
+            SafeslotMod.LOGGER.warn("Attempting to serialize null or empty backup list");
+            return "[]";
         }
         
+        JsonArray jsonArray = new JsonArray();
+        int serialized = 0;
+        
+        for (PlayerBackup backup : backups) {
+            try {
+                JsonObject backupJson = new JsonObject();
+                backupJson.addProperty("playerUuid", backup.getPlayerUuid().toString());
+                backupJson.addProperty("playerName", backup.getPlayerName());
+                backupJson.addProperty("timestamp", backup.getTimestamp());
+                
+                // Get NBT data
+                NbtCompound inventoryNbt = backup.getInventoryData();
+                NbtCompound backpackNbt = backup.getBackpackData();
+                
+                // Enhanced serialization with fallback for failures
+                String inventoryData = "";
+                String backpackData = "";
+                
+                // Serialize NBT data using enhanced method
+                if (!inventoryNbt.isEmpty()) {
+                    inventoryData = com.safeslot.util.NbtUtil.serializeNbtToBase64(inventoryNbt);
+                }
+                
+                if (!backpackNbt.isEmpty()) {
+                    backpackData = com.safeslot.util.NbtUtil.serializeNbtToBase64(backpackNbt);
+                }
+                
+                if (inventoryData.isEmpty() && backpackData.isEmpty()) {
+                    SafeslotMod.LOGGER.warn("Both inventory and backpack data are empty for backup {}", backup.getPlayerName());
+                }
+                
+                backupJson.addProperty("inventoryData", inventoryData);
+                backupJson.addProperty("backpackData", backpackData);
+                
+                jsonArray.add(backupJson);
+                serialized++;
+                
+            } catch (Exception e) {
+                SafeslotMod.LOGGER.error("Failed to serialize backup for {}: {}", backup.getPlayerName(), e.getMessage());
+            }
+        }
+        
+        SafeslotMod.LOGGER.debug("Serialized {}/{} backups successfully", serialized, backups.size());
         return jsonArray.toString();
     }
     
@@ -598,28 +668,68 @@ public class InventoryBackupManager {
     private static List<PlayerBackup> deserializePlayerBackups(String jsonContent) {
         List<PlayerBackup> backups = new ArrayList<>();
         
+        if (jsonContent == null || jsonContent.trim().isEmpty()) {
+            SafeslotMod.LOGGER.warn("Empty or null JSON content provided for deserialization");
+            return backups;
+        }
+        
         try {
             JsonArray jsonArray = JsonParser.parseString(jsonContent).getAsJsonArray();
+            int deserialized = 0;
             
             for (JsonElement element : jsonArray) {
-                JsonObject backupJson = element.getAsJsonObject();
-                
-                UUID playerUuid = UUID.fromString(backupJson.get("playerUuid").getAsString());
-                String playerName = backupJson.get("playerName").getAsString();
-                long timestamp = backupJson.get("timestamp").getAsLong();
-                
-                // Deserialize NBT data from Base64
-                NbtCompound inventoryData = com.safeslot.util.NbtUtil.deserializeNbtFromBase64(
-                    backupJson.get("inventoryData").getAsString());
-                NbtCompound backpackData = com.safeslot.util.NbtUtil.deserializeNbtFromBase64(
-                    backupJson.get("backpackData").getAsString());
-                
-                PlayerBackup backup = new PlayerBackup(playerUuid, playerName, timestamp, inventoryData, backpackData);
-                backups.add(backup);
+                try {
+                    JsonObject backupJson = element.getAsJsonObject();
+                    
+                    UUID playerUuid = UUID.fromString(backupJson.get("playerUuid").getAsString());
+                    String playerName = backupJson.get("playerName").getAsString();
+                    long timestamp = backupJson.get("timestamp").getAsLong();
+                    
+                    // Deserialize NBT data from Base64
+                    String inventoryDataStr = backupJson.get("inventoryData").getAsString();
+                    String backpackDataStr = backupJson.get("backpackData").getAsString();
+                    
+                    // Enhanced deserialization
+                    NbtCompound inventoryData = new NbtCompound();
+                    NbtCompound backpackData = new NbtCompound();
+                    
+                    // Deserialize NBT data with enhanced error handling
+                    if (!inventoryDataStr.isEmpty()) {
+
+                        inventoryData = com.safeslot.util.NbtUtil.deserializeNbtFromBase64(inventoryDataStr);
+                    }
+                    
+                    if (!backpackDataStr.isEmpty()) {
+                        backpackData = com.safeslot.util.NbtUtil.deserializeNbtFromBase64(backpackDataStr);
+                    }
+                    
+                    // Validate backup data - skip if both inventory and backpack are empty
+                    boolean hasValidInventory = inventoryData != null && !inventoryData.isEmpty() && 
+                        inventoryData.contains("totalItemsBackedUp") && inventoryData.contains("inventorySlots");
+                    boolean hasValidBackpack = backpackData != null && !backpackData.isEmpty();
+                    
+                    if (!hasValidInventory && !hasValidBackpack) {
+                        SafeslotMod.LOGGER.warn("Skipping corrupted backup for {} - both inventory and backpack data are invalid", playerName);
+                        continue; // Skip this corrupted backup
+                    }
+                    
+                    if (!hasValidInventory) {
+                        SafeslotMod.LOGGER.warn("Backup for {} has invalid inventory data but valid backpack - keeping backup", playerName);
+                    }
+                    
+                    PlayerBackup backup = new PlayerBackup(playerUuid, playerName, timestamp, inventoryData, backpackData);
+                    backups.add(backup);
+                    deserialized++;
+                    
+                } catch (Exception e) {
+                    SafeslotMod.LOGGER.error("Failed to deserialize individual backup: {}", e.getMessage());
+                }
             }
             
+            SafeslotMod.LOGGER.debug("Deserialized {}/{} backups successfully", deserialized, jsonArray.size());
+            
         } catch (Exception e) {
-            SafeslotMod.LOGGER.error("Failed to deserialize player backups: {}", e.getMessage());
+            SafeslotMod.LOGGER.error("Failed to deserialize player backups JSON: {}", e.getMessage(), e);
         }
         
         return backups;
